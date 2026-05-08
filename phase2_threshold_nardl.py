@@ -43,9 +43,14 @@ from statsmodels.tsa.api import VAR
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("phase2")
 
-DATA_FILE = Path("data/rubber_petrochemical_monthly_model_dataset_v3.xlsx")
-TABLES    = Path("tables");  TABLES.mkdir(exist_ok=True)
-FIGURES   = Path("figures"); FIGURES.mkdir(exist_ok=True)
+# Resolve paths relative to this script's location so it runs correctly
+# regardless of the current working directory. The data file and output
+# folders are expected to live in the same directory as this script.
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+DATA_FILE = SCRIPT_DIR / "rubber_petrochemical_monthly_model_dataset_v3.xlsx"
+TABLES    = SCRIPT_DIR / "tables";  TABLES.mkdir(exist_ok=True)
+FIGURES   = SCRIPT_DIR / "figures"; FIGURES.mkdir(exist_ok=True)
 
 RNG = np.random.default_rng(20260101)
 
@@ -90,8 +95,25 @@ df["dlnSR_neg"]  = df["sbr_neg_change"]
 df["fx_cny"] = np.log(df["fx_china_lcu_per_usd"])
 df["fx_thb"] = np.log(df["fx_thailand_lcu_per_usd"])
 
-# Regime variable (already pre-computed in v3)
-# Use regime_post2013 (12m deviation from rolling mean)
+# Regime variable: use precomputed column if available, otherwise build it
+# from the NBS rubber-product inventory series. The regime variable is the
+# 12-month deviation of log inventory from its rolling mean (post-2013 sample).
+if "regime_post2013" not in df.columns:
+    # Search for the NBS inventory column under any of its likely aliases
+    inv_candidates = [c for c in df.columns
+                      if "nbs" in c.lower() and ("inv" in c.lower() or "stock" in c.lower())]
+    if not inv_candidates:
+        inv_candidates = [c for c in df.columns
+                          if "rubber_product" in c.lower() or "nbs_inv" in c.lower()]
+    if not inv_candidates:
+        log.error("regime_post2013 not found and no NBS inventory column detected.")
+        log.error(f"Available columns: {sorted(df.columns.tolist())}")
+        raise KeyError("Cannot build regime_post2013: NBS inventory column missing.")
+    inv_col = inv_candidates[0]
+    log.info(f"Building regime_post2013 from inventory column '{inv_col}'")
+    log_inv = np.log(df[inv_col])
+    df["regime_post2013"] = log_inv - log_inv.rolling(12, min_periods=6).mean()
+
 log.info(f"regime_post2013 coverage: {df['regime_post2013'].notna().sum()}/{len(df)}")
 
 CONTROLS = ["ln_china_auto", "fx_cny", "fx_thb"]   # nbs_break_dummy is 1 throughout post-2013, drop
@@ -372,8 +394,18 @@ def write_decomp_table(res: dict, save: Path):
 # 6. Regime-specific local projections (H6 dynamic)
 # =========================================================================
 
-def regime_lp(d: pd.DataFrame, tau_hat: float) -> pd.DataFrame:
-    """Run asymmetric LP separately within each regime."""
+def regime_lp(d: pd.DataFrame, tau_hat: float) -> tuple[pd.DataFrame, dict]:
+    """Run asymmetric LP separately within each regime.
+
+    Returns
+    -------
+    rows : pd.DataFrame
+        Long-format coefficient estimates by horizon, regime, and shock variant.
+    sigma : dict
+        Standard deviations of each shock series (positive numbers) used to
+        scale coefficients into impulse responses for plotting. Computed from
+        the strictly nonzero portion of each clipped residual series.
+    """
     var_data = d[["dlnOIL", "dlnBD", "dlnSR", "dlnNR"]].dropna()
     var_fit = VAR(var_data).fit(maxlags=6, ic="aic")
     log.info(f"Regime LP: VAR(p={var_fit.k_ar}) on T={len(var_data)}")
@@ -384,10 +416,21 @@ def regime_lp(d: pd.DataFrame, tau_hat: float) -> pd.DataFrame:
     df_lp["eps_OIL"] = resid[:, 0]
     df_lp["eps_SR"]  = resid[:, 2]
     df_lp["eps_OIL_pos"] = df_lp["eps_OIL"].clip(lower=0)
-    df_lp["eps_OIL_neg"] = df_lp["eps_OIL"].clip(upper=0)
+    df_lp["eps_OIL_neg"] = df_lp["eps_OIL"].clip(upper=0)  # still <= 0
     df_lp["eps_SR_pos"]  = df_lp["eps_SR"].clip(lower=0)
-    df_lp["eps_SR_neg"]  = df_lp["eps_SR"].clip(upper=0)
+    df_lp["eps_SR_neg"]  = df_lp["eps_SR"].clip(upper=0)   # still <= 0
     df_lp["IL"] = (df_lp["regime_post2013"] <= tau_hat).astype(int)
+
+    # Shock magnitudes (positive numbers) for impulse-response scaling.
+    # Compute std on the strictly nonzero portion to avoid downward bias from
+    # the zeros introduced by clipping.
+    sigma = {
+        "eps_OIL_pos": float(df_lp.loc[df_lp["eps_OIL_pos"] > 0, "eps_OIL_pos"].std()),
+        "eps_OIL_neg": float(df_lp.loc[df_lp["eps_OIL_neg"] < 0, "eps_OIL_neg"].abs().std()),
+        "eps_SR_pos":  float(df_lp.loc[df_lp["eps_SR_pos"]  > 0, "eps_SR_pos"].std()),
+        "eps_SR_neg":  float(df_lp.loc[df_lp["eps_SR_neg"]  < 0, "eps_SR_neg"].abs().std()),
+    }
+    log.info(f"Shock sigma (for IRF scaling): {sigma}")
 
     rows = []
     for h in range(1, 19):   # shorter horizon for small sample
@@ -414,26 +457,39 @@ def regime_lp(d: pd.DataFrame, tau_hat: float) -> pd.DataFrame:
             except Exception:
                 continue
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), sigma
 
 
-def plot_regime_irf(lp: pd.DataFrame, shock: str, title: str, save: Path):
+def plot_regime_irf(lp: pd.DataFrame, sigma: dict, shock: str,
+                    title: str, save: Path):
+    """Plot impulse response of ln NR to +/-1 sigma shocks (not raw coefficients).
+
+    The response to a positive shock at horizon h is b_h^+ * (+sigma_pos);
+    the response to a negative shock at horizon h is b_h^- * (-sigma_neg).
+    Under co-directional pass-through (consistent with Table 3), the
+    positive-shock line lies above zero and the negative-shock line lies
+    below zero; magnitude asymmetry shows up as the negative-shock dip
+    being larger in absolute value than the positive-shock peak.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
     for ax, regime in zip(axes, ["Low", "High"]):
-        for sign, ls, lab in [(f"{shock}_pos", "-", "Positive"),
-                              (f"{shock}_neg", "--", "Negative")]:
+        for sign, ls, lab, scale in [
+                (f"{shock}_pos", "-",  "+1\u03c3 shock", +sigma[f"{shock}_pos"]),
+                (f"{shock}_neg", "--", "\u22121\u03c3 shock", -sigma[f"{shock}_neg"])]:
             sub = lp[(lp["regime"] == regime) & (lp["var"] == sign)]
-            if len(sub) == 0: continue
-            ax.plot(sub["horizon"], sub["est"], color="black", linestyle=ls,
-                    linewidth=1.5, label=f"{lab} shock")
-            ax.fill_between(sub["horizon"], sub["est"] - 1.96 * sub["se"],
-                            sub["est"] + 1.96 * sub["se"],
-                            color="grey", alpha=0.18)
+            if len(sub) == 0:
+                continue
+            irf    = sub["est"].values * scale
+            irf_se = sub["se"].values  * abs(scale)
+            ax.plot(sub["horizon"], irf, color="black", linestyle=ls,
+                    linewidth=1.5, label=lab)
+            ax.fill_between(sub["horizon"], irf - 1.96 * irf_se,
+                            irf + 1.96 * irf_se, color="grey", alpha=0.18)
         ax.axhline(0, color="black", linewidth=0.6)
         ax.set_title(f"{regime}-inventory regime")
         ax.set_xlabel("Horizon (months)")
         ax.legend(frameon=False)
-    axes[0].set_ylabel("Cumulative response of ln NR")
+    axes[0].set_ylabel("Impulse response of ln NR (log points)")
     fig.suptitle(title)
     plt.tight_layout()
     plt.savefig(save)
@@ -495,12 +551,14 @@ def main():
                  f"p = {dec['p_one_sided']:.3f}")
 
     log.info("\n=== Step 5: Regime-specific Local Projections ===")
-    lp = regime_lp(df, th["tau_hat"])
+    lp, sigma = regime_lp(df, th["tau_hat"])
     if len(lp) > 0:
         lp.to_csv(TABLES / "regime_lp_results.csv", index=False)
-        plot_regime_irf(lp, "eps_OIL", "Regime-specific LP: oil shock",
+        plot_regime_irf(lp, sigma, "eps_OIL",
+                        "Regime-specific LP: oil shock",
                         FIGURES / "regime_irf_oil.pdf")
-        plot_regime_irf(lp, "eps_SR", "Regime-specific LP: synthetic-rubber shock",
+        plot_regime_irf(lp, sigma, "eps_SR",
+                        "Regime-specific LP: synthetic-rubber shock",
                         FIGURES / "regime_irf_sr.pdf")
 
     log.info("\n[DONE] Phase 2 complete.")
